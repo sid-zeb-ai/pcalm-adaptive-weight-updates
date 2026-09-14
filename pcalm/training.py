@@ -76,6 +76,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
 
     rows = []
     steps_per_batch: list[int] = []
+    epoch_start = 0
     step = 0
     log_every = 100
     for epoch in range(training.epochs):
@@ -93,6 +94,14 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
                 )
         train_mse, train_ce, train_acc = evaluate(params, x_train, y_train, training.batch_size, eval_batch)
         test_mse, test_ce, test_acc = evaluate(params, x_test, y_test, training.batch_size, eval_batch)
+        epoch_steps = steps_per_batch[epoch_start:]
+        epoch_start = len(steps_per_batch)
+        print(
+            f"EPOCH epoch={epoch + 1} step={step} train_acc={train_acc:.4f} test_acc={test_acc:.4f} "
+            f"train_mse={train_mse:.4f} test_mse={test_mse:.4f} "
+            f"mean_inf_steps_epoch={float(np.mean(epoch_steps)) if epoch_steps else 0.0:.2f}",
+            flush=True,
+        )
         rows.append(
             {
                 "epoch": epoch + 1,

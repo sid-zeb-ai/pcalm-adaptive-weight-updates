@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--arrival-frac", type=float, default=0.1)
     p.add_argument("--criterion", choices=["sum", "max"], default="sum")
     p.add_argument("--seeds", default="0,1,2")
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--tag")
     p.add_argument("--out", type=Path, default=ROOT / "configs" / "run.yaml")
     return p.parse_args()
@@ -41,14 +42,15 @@ def main() -> None:
     a = parse_args()
     seeds = [int(s) for s in a.seeds.split(",") if s.strip()]
     ds = {"fashion_mnist": "fashion", "mnist": "mnist"}.get(a.dataset, a.dataset)
+    ep = f"_ep{a.epochs}" if a.epochs != 1 else ""
     if a.tag:
         tag = a.tag
     elif a.method == "bp":
-        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_bp"
+        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_bp{ep}"
     elif a.method == "pcalm_adaptive":
-        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_adaptive_{a.criterion}_tau{a.tau:g}_tmax{a.t_max}"
+        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_adaptive_{a.criterion}_tau{a.tau:g}_tmax{a.t_max}{ep}"
     else:
-        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_{a.method}_{a.budget}"
+        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_{a.method}_{a.budget}{ep}"
 
     def int_or_mult(v: str):
         return int(v) if v.isdigit() else v
@@ -74,7 +76,7 @@ def main() -> None:
             "criterion": a.criterion,
         },
         "training": {
-            "epochs": 1,
+            "epochs": a.epochs,
             "batch_size": 64,
             "eta0": 0.001,
             "gamma0": 1.0,
