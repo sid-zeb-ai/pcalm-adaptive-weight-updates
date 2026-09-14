@@ -1,26 +1,28 @@
 # Node configuration read by scripts/run_node.py. Experiment branches change ONLY this file.
-tag: fashion_relu_n32_l32_pcalm_2L
-seeds: [0, 1, 2]
+tag: fashion_relu_n32_l64_adaptive_sum_tau0.1_tmax3L
+seeds:
+- 0
+- 1
+- 2
 dataset: fashion_mnist
 model:
   width: 32
-  depth: 32
+  depth: 64
   activation: relu
 method:
-  name: pcalm            # bp | pc | pcalm | pcalm_adaptive
-  budget: 2L             # fixed inference budget (int or "<k>L"); ignored by bp
+  name: pcalm_adaptive
+  budget: 2L
   alpha: 1.0
   rho: 1.0
-  state_lr: auto         # paper's frozen eta_h = 1/lambda_max for this cell
+  state_lr: auto
   inner_steps: 1
   weight_credit_timing: pre_dual_energy
-  # pcalm_adaptive only:
-  tau: 0.0
+  tau: 0.1
   patience: 3
   t_min: 2
-  t_max: 0               # 0 -> budget; adaptive nodes set e.g. 3L
+  t_max: 3L
   arrival_frac: 0.1
-  criterion: sum         # sum | max
+  criterion: sum
 training:
   epochs: 1
   batch_size: 64
