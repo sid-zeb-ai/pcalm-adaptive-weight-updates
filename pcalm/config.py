@@ -35,6 +35,7 @@ class MethodConfig:
     t_min: int = 2
     t_max: int = 0
     arrival_frac: float = 0.1
+    criterion: str = "sum"  # "sum": layer-summed relative change; "max": max-normalised
 
 
 @dataclass(frozen=True)

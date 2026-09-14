@@ -21,9 +21,11 @@ class Schedule:
     t_min: int = 2
     t_max: int = 0
     arrival_frac: float = 0.1
+    criterion: str = "sum"
 
 
 ADAPTIVE_EPS = 1e-12
+ADAPTIVE_CRITERIA = ("sum", "max")
 
 
 def supervised_loss(params: Params, scales, skips, x, y, free, phi) -> jax.Array:
@@ -125,19 +127,28 @@ def _fro(a: jax.Array) -> jax.Array:
     return jnp.sqrt(jnp.sum(a * a))
 
 
-def _adaptive_cycle(params, scales, skips, x, y, free, duals, g_prev, *, state_lr, rho, alpha, inner_steps, phi):
+def _adaptive_cycle(params, scales, skips, x, y, free, duals, g_prev, *, state_lr, rho, alpha, inner_steps, phi, criterion="sum"):
     """One primal step followed by the stop statistics for the credit the weight update would see.
 
     Returns the updated activities, the residuals at those activities, the composite credit
     g_i = lambda_i + rho r_i (with lambda_i *before* this cycle's dual step, matching the
-    `pre_dual_energy` weight-credit timing), and the batch relative change delta_t of g.
+    `pre_dual_energy` weight-credit timing), and the batch relative change delta_t of g:
+      criterion="sum":  sum_i ||g_i - g_i^prev|| / (sum_i ||g_i|| + eps)
+      criterion="max":  max_i ||g_i - g_i^prev|| / (max_i ||g_i|| + eps)
+    The "max" form is sensitive to a single layer that is still moving (e.g. the input side
+    while the credit wave is still arriving), which the layer-summed form averages away.
     """
+    if criterion not in ADAPTIVE_CRITERIA:
+        raise ValueError(f"criterion must be one of {ADAPTIVE_CRITERIA}, got {criterion!r}")
     free = _solve_inner(params, scales, skips, x, y, free, duals, state_lr, rho, inner_steps, phi)
     residuals = constraint_residuals(params, scales, skips, x, free, phi)
     credit = [lam + rho * r for lam, r in zip(duals, residuals)]
-    num = jnp.sum(jnp.stack([_fro(g - gp) for g, gp in zip(credit, g_prev)]))
-    den = jnp.sum(jnp.stack([_fro(g) for g in credit])) + ADAPTIVE_EPS
-    delta = num / den
+    change = jnp.stack([_fro(g - gp) for g, gp in zip(credit, g_prev)])
+    size = jnp.stack([_fro(g) for g in credit])
+    if criterion == "sum":
+        delta = jnp.sum(change) / (jnp.sum(size) + ADAPTIVE_EPS)
+    else:
+        delta = jnp.max(change) / (jnp.max(size) + ADAPTIVE_EPS)
     return free, residuals, credit, delta
 
 
@@ -158,6 +169,7 @@ def run_pcalm_adaptive(
     arrival_frac: float,
     inner_steps: int,
     phi,
+    criterion: str = "sum",
 ):
     """PC-ALM whose inference budget is chosen per batch by a credit-stability trigger.
 
@@ -189,7 +201,7 @@ def run_pcalm_adaptive(
         t = t + 1
         free_c, residuals, credit, delta = _adaptive_cycle(
             params, scales, skips, x, y, free_c, duals_c, g_prev,
-            state_lr=state_lr, rho=rho, alpha=alpha, inner_steps=inner_steps, phi=phi,
+            state_lr=state_lr, rho=rho, alpha=alpha, inner_steps=inner_steps, phi=phi, criterion=criterion,
         )
         streak = jnp.where(delta < tau, streak + 1, 0)
         arrived = _fro(credit[0]) >= arrival_frac * _fro(credit[-1])
@@ -219,10 +231,11 @@ def trace_pcalm_adaptive(
 ):
     """Run exactly t_max primal-dual cycles and record per-cycle diagnostics.
 
-    Returns a dict of arrays indexed by cycle t = 1..t_max: `delta` (T,), and per-layer
-    Frobenius norms `credit_norm`, `residual_norm`, `dual_norm`, each (T, L-1). The dual norm
-    is that of lambda *before* the cycle's dual step, matching the weight-credit timing.
-    Used for the diagnostic trace only; the trigger itself lives in `run_pcalm_adaptive`.
+    Returns a dict of arrays indexed by cycle t = 1..t_max: `delta` (T,) for the "sum"
+    criterion, `delta_max` (T,) for the "max" criterion, and per-layer Frobenius norms
+    `credit_norm`, `residual_norm`, `dual_norm`, each (T, L-1). The dual norm is that of
+    lambda *before* the cycle's dual step, matching the weight-credit timing. Used for the
+    diagnostic trace only; the trigger itself lives in `run_pcalm_adaptive`.
     """
     free0 = free_init(params, scales, skips, x, phi)
     duals0 = zero_duals_like(constraint_residuals(params, scales, skips, x, free0, phi))
@@ -234,9 +247,12 @@ def trace_pcalm_adaptive(
             params, scales, skips, x, y, free_c, duals_c, g_prev,
             state_lr=state_lr, rho=rho, alpha=alpha, inner_steps=inner_steps, phi=phi,
         )
+        change = jnp.stack([_fro(g - gp) for g, gp in zip(credit, g_prev)])
+        size = jnp.stack([_fro(g) for g in credit])
         out = {
             "delta": delta,
-            "credit_norm": jnp.stack([_fro(g) for g in credit]),
+            "delta_max": jnp.max(change) / (jnp.max(size) + ADAPTIVE_EPS),
+            "credit_norm": size,
             "residual_norm": jnp.stack([_fro(r) for r in residuals]),
             "dual_norm": jnp.stack([_fro(lam) for lam in duals_c]),
         }
@@ -286,6 +302,7 @@ def infer_for_schedule(params: Params, scales, skips, x, y, schedule: Schedule, 
             arrival_frac=schedule.arrival_frac,
             inner_steps=schedule.inner_steps,
             phi=phi,
+            criterion=schedule.criterion,
         )
     raise ValueError(f"unknown schedule family: {schedule.family}")
 

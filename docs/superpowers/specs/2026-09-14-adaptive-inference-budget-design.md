@@ -75,6 +75,26 @@ The loop then performs the paper's final primal step and forms the weight gradie
 Hyperparameters swept in phase 1: `tau in {0.01, 0.03, 0.1}`. All others fixed as above. One
 setting must work across depths; per-cell tuning of `tau` is a negative result, not an option.
 
+### 3.1 Statistic variants (added after the initialisation trace)
+
+A trace of `delta_t` at initialisation on the four cells (Fashion-MNIST, ReLU, batch 64, the
+paper's `eta_h`) showed that the layer-summed statistic above is dominated by the many layers
+whose credit has already settled, so it falls below 0.03 well before the credit wave reaches the
+input layer. With `tau in {0.03, 0.1}` the stop is therefore decided entirely by the arrival
+guard (t = 54 for L = 32, t = 112 for L = 64, versus the predicted inflection 66 and 130),
+while the input-layer credit is still growing by a factor of two afterwards. `tau = 0.01` fires
+at 2.4 to 2.7 L on the deep cells and never within 3L on L = 16 and L = 32.
+
+To make the sweep informative, a second statistic is available via `criterion`:
+
+    "sum":  delta_t = sum_i ||g_i^(t) - g_i^(t-1)|| / ( sum_i ||g_i^(t)|| + eps )   (default)
+    "max":  delta_t = max_i ||g_i^(t) - g_i^(t-1)|| / ( max_i ||g_i^(t)|| + eps )
+
+The `max` form is sensitive to any single layer that is still moving. At initialisation with
+`tau = 0.03` it fires at 2.2 to 2.4 L on the L = 32 and L = 64 cells and at the 3L cap on
+L = 16. Phase 1 runs the approved `sum` sweep plus one extra sibling per cell with
+`criterion = max, tau = 0.03`.
+
 Batch semantics: the stop decision is shared by the whole batch because the weight update
 averages over the batch. Per-sample stopping is deferred to phase 2.
 
@@ -93,7 +113,21 @@ Methods per cell:
 - PC, `T = 2L`.
 - PC-ALM, `T = L`.
 - PC-ALM, `T = 2L`.
-- PC-ALM adaptive, `tau in {0.01, 0.03, 0.1}`, `t_max = 3L`.
+- PC-ALM adaptive, `criterion = sum`, `tau in {0.01, 0.03, 0.1}`, `t_max = 3L`.
+- PC-ALM adaptive, `criterion = max`, `tau = 0.03`, `t_max = 3L`.
+
+That is 8 methods x 4 cells = 32 nodes, each running 3 seeds sequentially.
+
+Run command (fixed on the baseline node; children change only `configs/run.yaml`):
+
+    uv sync --frozen --quiet && uv run --no-sync python scripts/run_node.py \
+      --config configs/run.yaml \
+      --data-dir /Users/sidvivek/.local/share/openresearch/data/pcalm \
+      --output-root /Users/sidvivek/.local/share/openresearch/files/augmented-lagrangian-predictive-coding/runs
+
+Measured on this machine: the (32, 32) cell at `T = 64` takes about 0.03 s per batch after
+JIT, so one seed of one epoch is about 30 s; the (32, 64) cells at `t_max = 192` are about
+six times that.
 
 Metrics per run, printed as one summary line and written to `summary.json`:
 

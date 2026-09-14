@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-min", type=int)
     parser.add_argument("--t-max", type=int)
     parser.add_argument("--arrival-frac", type=float)
+    parser.add_argument("--criterion", choices=["sum", "max"])
     parser.add_argument("--width", type=int)
     parser.add_argument("--depth", type=int)
     parser.add_argument("--activation", choices=["linear", "tanh", "relu"])
@@ -61,6 +62,7 @@ def main() -> None:
         "t_min": args.t_min,
         "t_max": args.t_max,
         "arrival_frac": args.arrival_frac,
+        "criterion": args.criterion,
     }
     training_updates = {
         "seed": args.seed,

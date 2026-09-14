@@ -58,6 +58,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         t_min=method.t_min,
         t_max=method.t_max,
         arrival_frac=method.arrival_frac,
+        criterion=method.criterion,
     )
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +140,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         "t_min": method.t_min,
         "t_max": cap if method.name != "bp" else 0,
         "arrival_frac": method.arrival_frac,
+        "criterion": method.criterion if method.name == "pcalm_adaptive" else "",
         "mean_inf_steps": float(steps_arr.mean()) if steps_arr.size else 0.0,
         "median_inf_steps": float(np.median(steps_arr)) if steps_arr.size else 0.0,
         "min_inf_steps": int(steps_arr.min()) if steps_arr.size else 0,
@@ -155,7 +157,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         + " ".join(
             f"{k}={final[k]}"
             for k in (
-                "method", "dataset", "activation", "width", "depth", "seed", "tau", "t_max",
+                "method", "dataset", "activation", "width", "depth", "seed", "tau", "criterion", "t_max",
                 "final_test_acc", "final_train_acc", "grad_cos_to_bp",
                 "mean_inf_steps", "median_inf_steps", "min_inf_steps", "max_inf_steps", "frac_at_cap",
             )
@@ -202,18 +204,19 @@ def make_trace_fn(schedule: Schedule, scales, skips, phi, state_lr: float, rho: 
 
 def write_trace(trace: dict[str, jax.Array], path: Path) -> None:
     delta = np.asarray(trace["delta"], dtype=np.float64)
+    delta_max = np.asarray(trace["delta_max"], dtype=np.float64)
     credit = np.asarray(trace["credit_norm"], dtype=np.float64)
     residual = np.asarray(trace["residual_norm"], dtype=np.float64)
     dual = np.asarray(trace["dual_norm"], dtype=np.float64)
     n_layers = credit.shape[1]
     header = (
-        ["t", "delta"]
+        ["t", "delta", "delta_max"]
         + [f"credit_l{i + 1}" for i in range(n_layers)]
         + [f"residual_l{i + 1}" for i in range(n_layers)]
         + [f"dual_l{i + 1}" for i in range(n_layers)]
     )
     t = np.arange(1, delta.shape[0] + 1, dtype=np.float64)[:, None]
-    table = np.concatenate([t, delta[:, None], credit, residual, dual], axis=1)
+    table = np.concatenate([t, delta[:, None], delta_max[:, None], credit, residual, dual], axis=1)
     np.savetxt(path, table, delimiter=",", header=",".join(header), comments="", fmt="%.6g")
 
 
