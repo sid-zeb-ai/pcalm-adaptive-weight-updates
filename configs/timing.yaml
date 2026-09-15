@@ -1,0 +1,15 @@
+# Timing node configuration read by scripts/run_node.py (kind: timing).
+# The caller runs this by `cp configs/timing.yaml configs/run.yaml`.
+kind: timing
+tag: timing_sparse_l64_widths_and_l128
+timing:
+  cells:
+    - width: 32
+      depth: 64
+    - width: 128
+      depth: 64
+    - width: 512
+      depth: 64
+    - width: 32
+      depth: 128
+  repeats: 20

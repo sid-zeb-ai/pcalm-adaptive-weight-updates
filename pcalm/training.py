@@ -18,6 +18,9 @@ from .metrics import mse_ce_accuracy, tree_cos
 from .model import activation_fn, init_params, logits, model_scales, skip_mask
 from .optim import adam_apply, adam_init
 
+# Both per-layer freeze-and-fire families: dense (masked) and sparse (really-skipping).
+LAYERWISE_NAMES = ("pcalm_layerwise", "pcalm_layerwise_sparse")
+
 
 def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dict[str, Any]:
     model = config.model
@@ -61,6 +64,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         criterion=method.criterion,
         eps_arrive=method.eps_arrive,
         mode=method.mode,
+        gate=method.gate,
     )
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -80,6 +84,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
     rows = []
     steps_per_batch: list[int] = []
     active_layer_cycles_per_batch: list[int] = []
+    executed_layer_cycles_per_batch: list[int] = []
     fire_times_per_batch: list[np.ndarray] = []
     epoch_start = 0
     step = 0
@@ -91,6 +96,7 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
             params, opt_state, inf_steps, info = update(params, opt_state, xb, yb)
             steps_per_batch.append(int(inf_steps))
             active_layer_cycles_per_batch.append(int(info["active_layer_cycles"]))
+            executed_layer_cycles_per_batch.append(int(info["executed_layer_cycles"]))
             fire_times_per_batch.append(np.asarray(info["fire_times"]))
             step += 1
             if step % log_every == 0:
@@ -126,15 +132,21 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
     if trace_fn is not None:
         write_trace(trace_fn(params, x_diag, y_diag), output_dir / "diag_trace_final.csv")
     steps_arr = np.asarray(steps_per_batch, dtype=np.float64)
-    is_layerwise = method.name == "pcalm_layerwise"
+    is_layerwise = method.name in LAYERWISE_NAMES
     cap = (
         (method.t_max if method.t_max > 0 else method.budget)
-        if method.name in ("pcalm_adaptive", "pcalm_layerwise")
+        if method.name in ("pcalm_adaptive",) + LAYERWISE_NAMES
         else method.budget
     )
     n_batches = len(steps_per_batch)
+    layer_cycle_denom = n_batches * n_hidden_layers * 2 * model.depth
     active_layer_cycles_frac = (
-        float(np.sum(active_layer_cycles_per_batch) / (n_batches * n_hidden_layers * 2 * model.depth))
+        float(np.sum(active_layer_cycles_per_batch) / layer_cycle_denom)
+        if (is_layerwise and n_batches and n_hidden_layers > 0)
+        else 0.0
+    )
+    executed_layer_cycles_frac = (
+        float(np.sum(executed_layer_cycles_per_batch) / layer_cycle_denom)
         if (is_layerwise and n_batches and n_hidden_layers > 0)
         else 0.0
     )
@@ -170,19 +182,21 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         "final_train_mse": rows[-1]["train_mse"],
         "final_test_mse": rows[-1]["test_mse"],
         "grad_cos_to_bp": float(diag["grad_cos_to_bp"]),
-        "tau": method.tau if method.name in ("pcalm_adaptive", "pcalm_layerwise") else 0.0,
+        "tau": method.tau if method.name in ("pcalm_adaptive",) + LAYERWISE_NAMES else 0.0,
         "patience": method.patience,
         "t_min": method.t_min,
         "t_max": cap if method.name != "bp" else 0,
         "arrival_frac": method.arrival_frac,
         "criterion": method.criterion if method.name == "pcalm_adaptive" else "",
-        "mode": method.mode if is_layerwise else "",
+        "mode": method.mode if method.name == "pcalm_layerwise" else "",
+        "gate": method.gate if method.name == "pcalm_layerwise_sparse" else "",
         "mean_inf_steps": float(steps_arr.mean()) if steps_arr.size else 0.0,
         "median_inf_steps": float(np.median(steps_arr)) if steps_arr.size else 0.0,
         "min_inf_steps": int(steps_arr.min()) if steps_arr.size else 0,
         "max_inf_steps": int(steps_arr.max()) if steps_arr.size else 0,
         "frac_at_cap": float(np.mean(steps_arr >= cap)) if (steps_arr.size and method.name != "bp") else 0.0,
         "active_layer_cycles_frac": active_layer_cycles_frac,
+        "executed_layer_cycles_frac": executed_layer_cycles_frac,
         "mean_fire_time_over_L": mean_fire_time_over_L,
     }
     write_csv(rows, output_dir / "metrics.csv")
@@ -214,10 +228,10 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         + " ".join(
             f"{k}={final[k]}"
             for k in (
-                "method", "dataset", "activation", "width", "depth", "seed", "tau", "criterion", "t_max", "mode",
+                "method", "dataset", "activation", "width", "depth", "seed", "tau", "criterion", "t_max", "mode", "gate",
                 "final_test_acc", "final_train_acc", "grad_cos_to_bp",
                 "mean_inf_steps", "median_inf_steps", "min_inf_steps", "max_inf_steps", "frac_at_cap",
-                "active_layer_cycles_frac", "mean_fire_time_over_L",
+                "active_layer_cycles_frac", "executed_layer_cycles_frac", "mean_fire_time_over_L",
             )
         ),
         flush=True,

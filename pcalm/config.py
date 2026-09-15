@@ -42,6 +42,9 @@ class MethodConfig:
     # "freeze_h" (skip primal only, keep integrating the dual).
     eps_arrive: float = 1e-3
     mode: str = "freeze"
+    # Gate for the sparse (real-skipping) family (name == "pcalm_layerwise_sparse"):
+    # "freeze" or "wavefront" (see pcalm.inference.run_pcalm_layerwise_sparse).
+    gate: str = "freeze"
 
 
 @dataclass(frozen=True)

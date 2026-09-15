@@ -25,11 +25,14 @@ class Schedule:
     # Per-layer freeze-and-fire fields (family == "pcalm_layerwise"); ignored otherwise.
     eps_arrive: float = 1e-3
     mode: str = "freeze"
+    # Gate for the sparse (real-skipping) family (family == "pcalm_layerwise_sparse").
+    gate: str = "freeze"
 
 
 ADAPTIVE_EPS = 1e-12
 ADAPTIVE_CRITERIA = ("sum", "max")
 LAYERWISE_MODES = ("freeze", "fire_only", "freeze_h")
+SPARSE_GATES = ("freeze", "wavefront")
 
 
 def supervised_loss(params: Params, scales, skips, x, y, free, phi) -> jax.Array:
@@ -398,17 +401,210 @@ def run_pcalm_layerwise(
 
     residuals_final = constraint_residuals(params, scales, skips, x, free, phi)
     duals_eff = [g - rho * r for g, r in zip(G_final, residuals_final)]
+    active_final = active_final.astype(jnp.int32)
+    info = {
+        "fire_times": jnp.stack(fire_time_final).astype(jnp.int32),
+        "active_layer_cycles": active_final,
+        "executed_layer_cycles": active_final,
+    }
+    return free, duals_eff, steps, info
+
+
+def _layer_local_energy(
+    params: Params, scales, skips, x, y, free, duals, layer_ix: int, h_i: jax.Array, rho: float, phi
+) -> jax.Array:
+    """E_i(h_i): the terms of the shifted AL energy that depend on hidden layer `i`, with every
+    other activity held at its value in `free` (a Jacobi update: `jax.grad` of this w.r.t. `h_i`
+    equals the corresponding block of `jax.grad(al_energy_shifted)(free)`, see spec section 2).
+    """
+    n_layers = len(free)
+    batch_size = x.shape[0]
+    z_prev = x if layer_ix == 0 else free[layer_ix - 1]
+    r_i = h_i - block_pred(params[layer_ix], scales[layer_ix], skips[layer_ix], z_prev, phi, is_first=(layer_ix == 0))
+    shifted_i = r_i + duals[layer_ix] / rho
+    term1 = 0.5 * rho * jnp.sum(shifted_i * shifted_i) / batch_size
+
+    if layer_ix < n_layers - 1:
+        pred_next = block_pred(params[layer_ix + 1], scales[layer_ix + 1], skips[layer_ix + 1], h_i, phi, is_first=False)
+        r_next = free[layer_ix + 1] - pred_next
+        shifted_next = r_next + duals[layer_ix + 1] / rho
+        term2 = 0.5 * rho * jnp.sum(shifted_next * shifted_next) / batch_size
+    else:
+        y_pred = block_pred(params[-1], scales[-1], skips[-1], h_i, phi, is_first=False)
+        term2 = 0.5 * jnp.mean(jnp.sum((y_pred - y) ** 2, axis=-1))
+
+    return term1 + term2
+
+
+def run_pcalm_layerwise_sparse(
+    params: Params,
+    scales,
+    skips,
+    x,
+    y,
+    *,
+    state_lr: float,
+    rho: float,
+    alpha: float,
+    tau: float,
+    patience: int,
+    t_min: int,
+    t_max: int,
+    eps_arrive: float,
+    gate: str,
+    inner_steps: int,
+    phi,
+):
+    """Sparse (really-skipping) per-layer freeze-and-fire PC-ALM.
+
+    Same firing rule, streak bookkeeping, frozen credit `G_i`, and `duals_eff` as
+    `run_pcalm_layerwise(mode="freeze")`, but each layer's primal step is wrapped in
+    `jax.lax.cond` so a skipped layer performs no matmuls. Gate `"freeze"` skips a layer once it
+    has fired; gate `"wavefront"` additionally skips a layer before the credit wave has reached
+    it (exact: `grad E_i` is identically zero there). See spec section 3 for the exact gate
+    definitions.
+
+    Returns `(free, duals_eff, steps, info)` with `info["fire_times"]`,
+    `info["active_layer_cycles"]` (phase-2 definition: not-yet-fired layers per cycle), and
+    `info["executed_layer_cycles"]` ((layer, cycle) pairs whose `lax.cond` took the compute
+    branch).
+    """
+    if gate not in SPARSE_GATES:
+        raise ValueError(f"gate must be one of {SPARSE_GATES}, got {gate!r}")
+    if t_max < 1:
+        raise ValueError("PC-ALM layerwise sparse t_max must be at least 1")
+    if t_min < 1:
+        raise ValueError("PC-ALM layerwise sparse t_min must be at least 1")
+    if patience < 1:
+        raise ValueError("PC-ALM layerwise sparse patience must be at least 1")
+    if inner_steps != 1:
+        raise ValueError("PC-ALM layerwise sparse only supports inner_steps=1")
+
+    free0 = free_init(params, scales, skips, x, phi)
+    duals0 = zero_duals_like(constraint_residuals(params, scales, skips, x, free0, phi))
+    n_layers = len(free0)
+    fired0 = [jnp.asarray(False) for _ in range(n_layers)]
+    streak0 = [jnp.asarray(0, dtype=jnp.int32) for _ in range(n_layers)]
+    g_prev0 = zero_duals_like(duals0)
+    G0 = zero_duals_like(duals0)
+    fire_time0 = [jnp.asarray(t_max, dtype=jnp.int32) for _ in range(n_layers)]
+    t0 = jnp.asarray(0, dtype=jnp.int32)
+    active0 = jnp.asarray(0, dtype=jnp.int32)
+    executed0 = jnp.asarray(0, dtype=jnp.int32)
+    done0 = jnp.asarray(False)
+
+    carry0 = (free0, duals0, g_prev0, G0, fired0, streak0, fire_time0, t0, active0, executed0, done0)
+
+    effective_lr = state_lr * free0[0].shape[0]
+
+    def cond(carry):
+        return jnp.logical_not(carry[-1])
+
+    def run_flags(fired, g_prev):
+        """run_i for every layer, from the *previous* cycle's credit norms `g_prev`."""
+        not_fired = [jnp.logical_not(f) for f in fired]
+        if gate == "freeze":
+            return not_fired
+        # wavefront: also require the wave has arrived, i.e. not (g_i^prev == 0 and g_{i+1}^prev == 0).
+        # The last hidden layer's downstream credit is the (always nonzero) supervised error, so it
+        # always runs until it fires.
+        g_norm = [_fro(g) for g in g_prev]
+        flags = []
+        for i in range(n_layers):
+            if i == n_layers - 1:
+                arrived = jnp.asarray(True)
+            else:
+                arrived = jnp.logical_not((g_norm[i] == 0.0) & (g_norm[i + 1] == 0.0))
+            flags.append(not_fired[i] & arrived)
+        return flags
+
+    def body(carry):
+        free_c, duals_c, g_prev, G_c, fired, streak, fire_time, t, active, executed, _ = carry
+        t = t + 1
+
+        run_i = run_flags(fired, g_prev)
+
+        new_free = []
+        for layer_ix in range(n_layers):
+
+            def compute_fn(h_i, layer_ix=layer_ix):
+                grad_i = jax.grad(
+                    lambda h: _layer_local_energy(params, scales, skips, x, y, free_c, duals_c, layer_ix, h, rho, phi)
+                )(h_i)
+                return h_i - effective_lr * grad_i
+
+            def skip_fn(h_i):
+                return h_i
+
+            new_free.append(jax.lax.cond(run_i[layer_ix], compute_fn, skip_fn, free_c[layer_ix]))
+
+        free_next = new_free
+
+        residuals = constraint_residuals(params, scales, skips, x, free_next, phi)
+        credit = [lam + rho * r for lam, r in zip(duals_c, residuals)]
+
+        change = [_fro(g - gp) for g, gp in zip(credit, g_prev)]
+        size = [_fro(g) for g in credit]
+        d = [c / (s + ADAPTIVE_EPS) for c, s in zip(change, size)]
+        streak = [jnp.where(dd < tau, s + 1, 0) for dd, s in zip(d, streak)]
+
+        active = active + sum(jnp.where(f, 0, 1) for f in fired)
+        executed = executed + sum(jnp.where(r, 1, 0) for r in run_i)
+
+        fire_now = [
+            (~f) & (t >= t_min) & (s_fro >= eps_arrive) & (s_streak >= patience)
+            for f, s_fro, s_streak in zip(fired, size, streak)
+        ]
+        G_c = [jnp.where(fn, g, G) for fn, g, G in zip(fire_now, credit, G_c)]
+        fire_time = [jnp.where(fn, t, ft) for fn, ft in zip(fire_now, fire_time)]
+        fired = [f | fn for f, fn in zip(fired, fire_now)]
+
+        done = jnp.stack(fired).all() | (t >= t_max)
+        G_c = [jnp.where(done & ~f, g, G) for f, g, G in zip(fired, credit, G_c)]
+        fire_time = [jnp.where(done & ~f, t, ft) for f, ft in zip(fired, fire_time)]
+
+        # Dual step: skipped for layers fired as of *this* cycle (post fire_now, matching
+        # `run_pcalm_layerwise(mode="freeze")` exactly, including a layer that fires this very
+        # cycle); for a pre-arrival wavefront layer r_i = 0 so stepping it is a no-op regardless.
+        # Skipped entirely on the done cycle (final cycle is a primal step only).
+        duals_next = []
+        for lam, r, f in zip(duals_c, residuals, fired):
+            stepped = lam + alpha * r
+            kept = jnp.where(f, lam, stepped)
+            duals_next.append(jnp.where(done, lam, kept))
+
+        return (free_next, duals_next, credit, G_c, fired, streak, fire_time, t, active, executed, done)
+
+    (
+        free,
+        duals_before,
+        credit_final,
+        G_final,
+        fired_final,
+        _,
+        fire_time_final,
+        steps,
+        active_final,
+        executed_final,
+        _,
+    ) = jax.lax.while_loop(cond, body, carry0)
+
+    residuals_final = constraint_residuals(params, scales, skips, x, free, phi)
+    duals_eff = [g - rho * r for g, r in zip(G_final, residuals_final)]
     info = {
         "fire_times": jnp.stack(fire_time_final).astype(jnp.int32),
         "active_layer_cycles": active_final.astype(jnp.int32),
+        "executed_layer_cycles": executed_final.astype(jnp.int32),
     }
     return free, duals_eff, steps, info
 
 
 def _no_layerwise_info(n_layers: int, steps) -> dict[str, jax.Array]:
+    active = (jnp.asarray(n_layers, dtype=jnp.int32) * steps).astype(jnp.int32)
     return {
         "fire_times": jnp.zeros((n_layers,), dtype=jnp.int32),
-        "active_layer_cycles": (jnp.asarray(n_layers, dtype=jnp.int32) * steps).astype(jnp.int32),
+        "active_layer_cycles": active,
+        "executed_layer_cycles": active,
     }
 
 
@@ -478,6 +674,25 @@ def infer_for_schedule(params: Params, scales, skips, x, y, schedule: Schedule, 
             t_max=schedule.t_max if schedule.t_max > 0 else schedule.budget,
             eps_arrive=schedule.eps_arrive,
             mode=schedule.mode,
+            inner_steps=schedule.inner_steps,
+            phi=phi,
+        )
+    if schedule.family == "pcalm_layerwise_sparse":
+        return run_pcalm_layerwise_sparse(
+            params,
+            scales,
+            skips,
+            x,
+            y,
+            state_lr=state_lr,
+            rho=rho,
+            alpha=schedule.alpha,
+            tau=schedule.tau,
+            patience=schedule.patience,
+            t_min=schedule.t_min,
+            t_max=schedule.t_max if schedule.t_max > 0 else schedule.budget,
+            eps_arrive=schedule.eps_arrive,
+            gate=schedule.gate,
             inner_steps=schedule.inner_steps,
             phi=phi,
         )

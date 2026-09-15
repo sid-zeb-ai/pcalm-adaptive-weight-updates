@@ -62,6 +62,11 @@ def main() -> None:
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    if str(raw.pop("kind", "")) == "timing":
+        import pcalm.timing as timing  # noqa: E402 (local import: only needed for kind=timing)
+
+        timing.run_timing(raw, args.output_root, args.data_dir)
+        return
     seeds = [int(s) for s in raw.pop("seeds", [0])]
     tag = str(raw.pop("tag", "run"))
     method_raw = dict(raw.get("method", {}) or {})
@@ -92,7 +97,7 @@ def main() -> None:
 
     keys = [
         "final_test_acc", "final_train_acc", "grad_cos_to_bp", "mean_inf_steps", "median_inf_steps", "frac_at_cap",
-        "active_layer_cycles_frac", "mean_fire_time_over_L",
+        "active_layer_cycles_frac", "executed_layer_cycles_frac", "mean_fire_time_over_L",
     ]
     agg = {"tag": tag, "n_seeds": len(summaries), "method": base.method.name, "width": width, "depth": depth,
            "activation": activation, "dataset": dataset, "tau": base.method.tau, "t_max": base.method.t_max,
