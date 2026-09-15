@@ -81,6 +81,12 @@ def _frac(count: int, n_hidden_layers: int, two_l: int) -> float:
     return float(count) / denom if denom > 0 else 0.0
 
 
+def _frac_l(count: int, depth: int, two_l: int) -> float:
+    """Forward-refresh fraction, normalised by L * 2L (per task instruction)."""
+    denom = depth * two_l
+    return float(count) / denom if denom > 0 else 0.0
+
+
 def _time_calls(call, repeats: int) -> np.ndarray:
     # Warm up (also triggers compilation).
     for _ in range(WARMUP_CALLS):
@@ -173,6 +179,7 @@ def run_timing(raw: dict[str, Any], output_root: str, data_dir: str) -> None:
                 dense_median_ms = median_ms
 
             out = call()
+            forward_refresh_frac = 0.0
             if impl_name == "dense_fixed_2L":
                 free, duals = out
                 steps = two_l
@@ -183,12 +190,14 @@ def run_timing(raw: dict[str, Any], output_root: str, data_dir: str) -> None:
                 steps = int(steps_arr)
                 active_frac = _frac(int(info["active_layer_cycles"]), n_hidden_layers, two_l)
                 executed_frac = _frac(int(info["executed_layer_cycles"]), n_hidden_layers, two_l)
+                if "forward_refreshes" in info:
+                    forward_refresh_frac = _frac_l(int(info["forward_refreshes"]), depth, two_l)
 
             ratio = median_ms / dense_median_ms if dense_median_ms else 1.0
             print(
                 f"TIMING cell={cell_name} impl={impl_name} ms_median={median_ms:.4f} ms_iqr={iqr_ms:.4f} "
                 f"steps={steps} active_frac={active_frac:.4f} executed_frac={executed_frac:.4f} "
-                f"ratio_to_dense_2L={ratio:.4f}",
+                f"forward_refresh_frac={forward_refresh_frac:.4f} ratio_to_dense_2L={ratio:.4f}",
                 flush=True,
             )
             csv_rows.append(
@@ -202,6 +211,7 @@ def run_timing(raw: dict[str, Any], output_root: str, data_dir: str) -> None:
                     "steps": steps,
                     "active_frac": active_frac,
                     "executed_frac": executed_frac,
+                    "forward_refresh_frac": forward_refresh_frac,
                     "ratio_to_dense_2L": ratio,
                 }
             )

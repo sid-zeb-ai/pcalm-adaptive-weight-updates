@@ -410,32 +410,6 @@ def run_pcalm_layerwise(
     return free, duals_eff, steps, info
 
 
-def _layer_local_energy(
-    params: Params, scales, skips, x, y, free, duals, layer_ix: int, h_i: jax.Array, rho: float, phi
-) -> jax.Array:
-    """E_i(h_i): the terms of the shifted AL energy that depend on hidden layer `i`, with every
-    other activity held at its value in `free` (a Jacobi update: `jax.grad` of this w.r.t. `h_i`
-    equals the corresponding block of `jax.grad(al_energy_shifted)(free)`, see spec section 2).
-    """
-    n_layers = len(free)
-    batch_size = x.shape[0]
-    z_prev = x if layer_ix == 0 else free[layer_ix - 1]
-    r_i = h_i - block_pred(params[layer_ix], scales[layer_ix], skips[layer_ix], z_prev, phi, is_first=(layer_ix == 0))
-    shifted_i = r_i + duals[layer_ix] / rho
-    term1 = 0.5 * rho * jnp.sum(shifted_i * shifted_i) / batch_size
-
-    if layer_ix < n_layers - 1:
-        pred_next = block_pred(params[layer_ix + 1], scales[layer_ix + 1], skips[layer_ix + 1], h_i, phi, is_first=False)
-        r_next = free[layer_ix + 1] - pred_next
-        shifted_next = r_next + duals[layer_ix + 1] / rho
-        term2 = 0.5 * rho * jnp.sum(shifted_next * shifted_next) / batch_size
-    else:
-        y_pred = block_pred(params[-1], scales[-1], skips[-1], h_i, phi, is_first=False)
-        term2 = 0.5 * jnp.mean(jnp.sum((y_pred - y) ** 2, axis=-1))
-
-    return term1 + term2
-
-
 def run_pcalm_layerwise_sparse(
     params: Params,
     scales,
@@ -455,19 +429,30 @@ def run_pcalm_layerwise_sparse(
     inner_steps: int,
     phi,
 ):
-    """Sparse (really-skipping) per-layer freeze-and-fire PC-ALM.
+    """Sparse (really-skipping) per-layer freeze-and-fire PC-ALM (v2).
 
     Same firing rule, streak bookkeeping, frozen credit `G_i`, and `duals_eff` as
-    `run_pcalm_layerwise(mode="freeze")`, but each layer's primal step is wrapped in
-    `jax.lax.cond` so a skipped layer performs no matmuls. Gate `"freeze"` skips a layer once it
-    has fired; gate `"wavefront"` additionally skips a layer before the credit wave has reached
-    it (exact: `grad E_i` is identically zero there). See spec section 3 for the exact gate
-    definitions.
+    `run_pcalm_layerwise(mode="freeze")`, but each active layer costs exactly one backward
+    (`jax.vjp` of `block_pred`, which recovers `J_{i+1}^T c_{i+1}` including the residual skip
+    connection and phi' exactly) plus one gated forward refresh, instead of two forward matmuls
+    per layer: `preds[i]` (the prediction feeding hidden layer `i`, `i = 0..n_layers-1`) and
+    `preds[n_layers]` (the output prediction) are cached in the carry across cycles. Each cycle,
+    the backward step reads the *old* cached `preds` (Jacobi: exactly what dense
+    `jax.grad(al_energy_shifted)(free)` would see), then a single post-update refresh -- gated by
+    `run_i`, this cycle's executed layers -- brings `preds` up to date with the just-updated
+    `free` for the next cycle's backward step and for this cycle's trigger statistic/firing/dual
+    step (matching dense `constraint_residuals(free_next)` exactly). Both the backward and the
+    refresh are wrapped in `jax.lax.cond` so a skipped layer performs no matmuls. Gate `"freeze"`
+    skips a layer once it has fired; gate `"wavefront"` additionally skips a layer before the
+    credit wave has reached it (exact: `grad E_i` is identically zero there). See spec section 3
+    for the exact gate definitions.
 
     Returns `(free, duals_eff, steps, info)` with `info["fire_times"]`,
-    `info["active_layer_cycles"]` (phase-2 definition: not-yet-fired layers per cycle), and
-    `info["executed_layer_cycles"]` ((layer, cycle) pairs whose `lax.cond` took the compute
-    branch).
+    `info["active_layer_cycles"]` (phase-2 definition: not-yet-fired layers per cycle),
+    `info["executed_layer_cycles"]` ((layer, cycle) pairs whose backward `lax.cond` took the
+    compute branch), and `info["forward_refreshes"]` ((layer, cycle) pairs whose post-update
+    forward-refresh `lax.cond` took the compute branch; equal to `executed_layer_cycles` here
+    since both are gated by the same `run_i`, but tracked separately for the timing harness).
     """
     if gate not in SPARSE_GATES:
         raise ValueError(f"gate must be one of {SPARSE_GATES}, got {gate!r}")
@@ -483,6 +468,16 @@ def run_pcalm_layerwise_sparse(
     free0 = free_init(params, scales, skips, x, phi)
     duals0 = zero_duals_like(constraint_residuals(params, scales, skips, x, free0, phi))
     n_layers = len(free0)
+    batch_size = x.shape[0]
+    effective_lr = state_lr * batch_size
+
+    # `preds[i]` is `pred_i` (feeds hidden layer i) for i = 0..n_layers-1, and `preds[n_layers]`
+    # is `pred_L` (the output prediction). At init, `free0 == forward(...)[:-1]` was built from
+    # exactly these predictions, so both are already fresh: `preds0[i] == free0[i]` and
+    # `preds0[n_layers]` is the logits.
+    preds0 = list(free0) + [block_pred(params[-1], scales[-1], skips[-1], free0[-1], phi, is_first=False)]
+    changed0 = [jnp.asarray(False) for _ in range(n_layers)]
+
     fired0 = [jnp.asarray(False) for _ in range(n_layers)]
     streak0 = [jnp.asarray(0, dtype=jnp.int32) for _ in range(n_layers)]
     g_prev0 = zero_duals_like(duals0)
@@ -491,11 +486,13 @@ def run_pcalm_layerwise_sparse(
     t0 = jnp.asarray(0, dtype=jnp.int32)
     active0 = jnp.asarray(0, dtype=jnp.int32)
     executed0 = jnp.asarray(0, dtype=jnp.int32)
+    refresh0 = jnp.asarray(0, dtype=jnp.int32)
     done0 = jnp.asarray(False)
 
-    carry0 = (free0, duals0, g_prev0, G0, fired0, streak0, fire_time0, t0, active0, executed0, done0)
-
-    effective_lr = state_lr * free0[0].shape[0]
+    carry0 = (
+        free0, duals0, preds0, changed0, g_prev0, G0, fired0, streak0, fire_time0,
+        t0, active0, executed0, refresh0, done0,
+    )
 
     def cond(carry):
         return jnp.logical_not(carry[-1])
@@ -518,29 +515,80 @@ def run_pcalm_layerwise_sparse(
             flags.append(not_fired[i] & arrived)
         return flags
 
+    def gated_refresh(free_src, changed_flags, preds_src):
+        """Recompute `preds[i]` from `free_src[i-1]` (or `free_src[-1]` for the output) wherever
+        `changed_flags[i-1]` (resp. `changed_flags[n_layers-1]`) says that input moved; otherwise
+        keep the cached value. Used both for the pre-backward preds (Jacobi, from the *old*
+        activities: `changed_flags` there is "did this layer run last cycle") and the
+        post-backward preds (from `free_next`: `changed_flags` there is `run_i`, this cycle's).
+        """
+        new_preds = [preds_src[0]]  # pred_0 depends only on x, which never changes.
+        for i in range(1, n_layers):
+            def refresh_fn(_unused, i=i):
+                return block_pred(params[i], scales[i], skips[i], free_src[i - 1], phi, is_first=False)
+
+            def keep_fn(_unused, i=i):
+                return preds_src[i]
+
+            new_preds.append(jax.lax.cond(changed_flags[i - 1], refresh_fn, keep_fn, preds_src[i]))
+
+        def refresh_out(_unused):
+            return block_pred(params[-1], scales[-1], skips[-1], free_src[-1], phi, is_first=False)
+
+        def keep_out(_unused):
+            return preds_src[n_layers]
+
+        new_preds.append(jax.lax.cond(changed_flags[n_layers - 1], refresh_out, keep_out, preds_src[n_layers]))
+        return new_preds
+
     def body(carry):
-        free_c, duals_c, g_prev, G_c, fired, streak, fire_time, t, active, executed, _ = carry
+        (
+            free_c, duals_c, preds_c, changed, g_prev, G_c, fired, streak, fire_time,
+            t, active, executed, refresh, _,
+        ) = carry
         t = t + 1
+
+        # --- 1. `preds_c` is already fresh relative to `free_c` (refreshed at the end of the
+        # previous cycle, or at init); no refresh needed here. It reflects the Jacobi state the
+        # dense `jax.grad` would see: old activities throughout.
+        old_residuals = [free_c[i] - preds_c[i] for i in range(n_layers)]
+        old_credit = [lam + rho * r for lam, r in zip(duals_c, old_residuals)]
+        old_c_last = y - preds_c[n_layers]  # downstream credit past the last hidden layer.
 
         run_i = run_flags(fired, g_prev)
 
+        # --- 2/3. Gated backward: grad_i = (g_i - J_{i+1}^T c_{i+1}) / B via vjp of block_pred,
+        # using the OLD (pre-update) preds/credit throughout -- exact Jacobi match to dense
+        # jax.grad(al_energy_shifted)(free_c). ---
         new_free = []
-        for layer_ix in range(n_layers):
+        for i in range(n_layers):
+            downstream_c = old_credit[i + 1] if i < n_layers - 1 else old_c_last
+            next_ix = i + 1 if i < n_layers - 1 else n_layers  # index of params/scales/skips for pred_{i+1}
 
-            def compute_fn(h_i, layer_ix=layer_ix):
-                grad_i = jax.grad(
-                    lambda h: _layer_local_energy(params, scales, skips, x, y, free_c, duals_c, layer_ix, h, rho, phi)
-                )(h_i)
+            def compute_fn(h_i, i=i, downstream_c=downstream_c, next_ix=next_ix):
+                _, vjp_fn = jax.vjp(
+                    lambda h: block_pred(params[next_ix], scales[next_ix], skips[next_ix], h, phi, is_first=False),
+                    h_i,
+                )
+                (jt_c,) = vjp_fn(downstream_c)
+                grad_i = (old_credit[i] - jt_c) / batch_size
                 return h_i - effective_lr * grad_i
 
             def skip_fn(h_i):
                 return h_i
 
-            new_free.append(jax.lax.cond(run_i[layer_ix], compute_fn, skip_fn, free_c[layer_ix]))
+            new_free.append(jax.lax.cond(run_i[i], compute_fn, skip_fn, free_c[i]))
 
         free_next = new_free
+        executed = executed + sum(jnp.where(r, 1, 0) for r in run_i)
 
-        residuals = constraint_residuals(params, scales, skips, x, free_next, phi)
+        # --- 4. Post-update forward refresh, gated by `run_i` (this cycle's changes): brings
+        # `preds` up to date with `free_next`, matching dense `constraint_residuals(free_next)`
+        # exactly. Carried forward as `preds_c` for the *next* cycle's step 1. ---
+        preds_next = gated_refresh(free_next, run_i, preds_c)
+        refresh = refresh + sum(jnp.where(r, 1, 0) for r in run_i)
+
+        residuals = [free_next[i] - preds_next[i] for i in range(n_layers)]
         credit = [lam + rho * r for lam, r in zip(duals_c, residuals)]
 
         change = [_fro(g - gp) for g, gp in zip(credit, g_prev)]
@@ -549,8 +597,8 @@ def run_pcalm_layerwise_sparse(
         streak = [jnp.where(dd < tau, s + 1, 0) for dd, s in zip(d, streak)]
 
         active = active + sum(jnp.where(f, 0, 1) for f in fired)
-        executed = executed + sum(jnp.where(r, 1, 0) for r in run_i)
 
+        # --- 5. Firing rule, G_i, done, dual step: identical to v1 / run_pcalm_layerwise. ---
         fire_now = [
             (~f) & (t >= t_min) & (s_fro >= eps_arrive) & (s_streak >= patience)
             for f, s_fro, s_streak in zip(fired, size, streak)
@@ -573,20 +621,14 @@ def run_pcalm_layerwise_sparse(
             kept = jnp.where(f, lam, stepped)
             duals_next.append(jnp.where(done, lam, kept))
 
-        return (free_next, duals_next, credit, G_c, fired, streak, fire_time, t, active, executed, done)
+        return (
+            free_next, duals_next, preds_next, run_i, credit, G_c, fired, streak, fire_time,
+            t, active, executed, refresh, done,
+        )
 
     (
-        free,
-        duals_before,
-        credit_final,
-        G_final,
-        fired_final,
-        _,
-        fire_time_final,
-        steps,
-        active_final,
-        executed_final,
-        _,
+        free, duals_before, _preds_final, _changed_final, credit_final, G_final, fired_final, _,
+        fire_time_final, steps, active_final, executed_final, refresh_final, _,
     ) = jax.lax.while_loop(cond, body, carry0)
 
     residuals_final = constraint_residuals(params, scales, skips, x, free, phi)
@@ -595,6 +637,7 @@ def run_pcalm_layerwise_sparse(
         "fire_times": jnp.stack(fire_time_final).astype(jnp.int32),
         "active_layer_cycles": active_final.astype(jnp.int32),
         "executed_layer_cycles": executed_final.astype(jnp.int32),
+        "forward_refreshes": refresh_final.astype(jnp.int32),
     }
     return free, duals_eff, steps, info
 

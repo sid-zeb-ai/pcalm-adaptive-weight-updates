@@ -7,7 +7,6 @@ import pytest
 from pcalm.inference import (
     SPARSE_GATES,
     Schedule,
-    _layer_local_energy,
     al_energy_shifted,
     free_init,
     method_grad,
@@ -17,7 +16,7 @@ from pcalm.inference import (
     run_pcalm_layerwise_sparse,
     zero_duals_like,
 )
-from pcalm.model import activation_fn, init_params, model_scales, skip_mask
+from pcalm.model import activation_fn, block_pred, init_params, model_scales, skip_mask
 
 
 def small_case(depth: int = 6, width: int = 5, n: int = 7, activation: str = "tanh"):
@@ -34,10 +33,13 @@ COMMON = dict(state_lr=0.1, rho=1.0, alpha=1.0, inner_steps=1)
 
 
 # --- Section 5, bullet 1: per-layer grad E_i equals the dense gradient block. ---
+# v2 computes grad_i = (g_i - J_{i+1}^T c_{i+1}) / B via jax.vjp of block_pred instead of
+# jax.grad of an explicit local-energy scalar; verify that formula directly against the dense
+# jax.grad(al_energy_shifted) block, for every hidden layer.
 
 
 @pytest.mark.parametrize("activation", ["tanh", "relu", "linear"])
-def test_layer_local_energy_grad_matches_dense_block(activation):
+def test_vjp_layer_gradient_matches_dense_block(activation):
     params, scales, skips, phi, x, y = small_case(depth=8, activation=activation)
     free = free_init(params, scales, skips, x, phi)
     keys = jax.random.split(jax.random.PRNGKey(2), len(free))
@@ -45,16 +47,33 @@ def test_layer_local_energy_grad_matches_dense_block(activation):
     duals_keys = jax.random.split(jax.random.PRNGKey(3), len(free))
     duals = [0.05 * jax.random.normal(k, f.shape) for f, k in zip(free, duals_keys)]
     rho = 1.3
+    n_layers = len(free)
+    batch_size = x.shape[0]
 
     dense_grad = jax.grad(lambda fr: al_energy_shifted(params, scales, skips, x, y, fr, duals, rho, phi))(free)
 
-    for layer_ix in range(len(free)):
-        g_local = jax.grad(
-            lambda h, layer_ix=layer_ix: _layer_local_energy(
-                params, scales, skips, x, y, free, duals, layer_ix, h, rho, phi
-            )
-        )(free[layer_ix])
-        assert jnp.allclose(g_local, dense_grad[layer_ix], atol=1e-6, rtol=1e-6)
+    residuals = []
+    for i in range(n_layers):
+        z_prev = x if i == 0 else free[i - 1]
+        pred_i = block_pred(params[i], scales[i], skips[i], z_prev, phi, is_first=(i == 0))
+        residuals.append(free[i] - pred_i)
+    credit = [lam + rho * r for lam, r in zip(duals, residuals)]
+    y_pred = block_pred(params[-1], scales[-1], skips[-1], free[-1], phi, is_first=False)
+    c_last = y - y_pred
+
+    for i in range(n_layers):
+        downstream_c = credit[i + 1] if i < n_layers - 1 else c_last
+        next_ix = i + 1 if i < n_layers - 1 else len(params) - 1  # index into params (output layer if last)
+
+        _, vjp_fn = jax.vjp(
+            lambda h, next_ix=next_ix: block_pred(
+                params[next_ix], scales[next_ix], skips[next_ix], h, phi, is_first=False
+            ),
+            free[i],
+        )
+        (jt_c,) = vjp_fn(downstream_c)
+        g_local = (credit[i] - jt_c) / batch_size
+        assert jnp.allclose(g_local, dense_grad[i], atol=1e-6, rtol=1e-6)
 
 
 # --- Section 5, bullet 2 & 3: sparse gates reproduce dense run_pcalm_layerwise(mode="freeze"). ---
