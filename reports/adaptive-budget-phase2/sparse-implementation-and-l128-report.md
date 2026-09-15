@@ -1,8 +1,7 @@
 # Round 5: sparse layer-wise PC-ALM, wall-clock, and the L = 128 cell
 
 Date: 2026-09-14. Follows the phase-2 report (`adaptive-budget-phase2-report.md`). Design:
-`../../worktree docs/design/2026-09-14-sparse-layerwise-design.md` (also on the
-GitHub branch `sparse-implementation`). Code: `run_pcalm_layerwise_sparse` and `pcalm/timing.py`;
+`docs/design/2026-09-14-sparse-layerwise-design.md` in the repository root. Code: `run_pcalm_layerwise_sparse` and `pcalm/timing.py`;
 51 unit tests pass, including exact reproduction of the dense phase-2 method in both gates.
 
 ## Questions
