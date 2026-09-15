@@ -1,5 +1,5 @@
 # Node configuration read by scripts/run_node.py. Experiment branches change ONLY this file.
-tag: fashion_relu_n32_l64_adaptive_sum_tau0.1_tmax3L
+tag: fashion_relu_n32_l64_layerwise_freeze_tau0.1_tmax3L
 seeds:
 - 0
 - 1
@@ -10,7 +10,7 @@ model:
   depth: 64
   activation: relu
 method:
-  name: pcalm_adaptive
+  name: pcalm_layerwise
   budget: 2L
   alpha: 1.0
   rho: 1.0
@@ -23,6 +23,8 @@ method:
   t_max: 3L
   arrival_frac: 0.1
   criterion: sum
+  eps_arrive: 0.001
+  mode: freeze
 training:
   epochs: 1
   batch_size: 64
