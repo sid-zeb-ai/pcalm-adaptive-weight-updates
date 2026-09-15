@@ -1,15 +1,35 @@
-# Timing node configuration read by scripts/run_node.py (kind: timing).
-# The caller runs this by `cp configs/timing.yaml configs/run.yaml`.
-kind: timing
-tag: timing_sparse_l64_widths_and_l128
-timing:
-  cells:
-    - width: 32
-      depth: 64
-    - width: 128
-      depth: 64
-    - width: 512
-      depth: 64
-    - width: 32
-      depth: 128
-  repeats: 20
+# Node configuration read by scripts/run_node.py. Experiment branches change ONLY this file.
+tag: fashion_relu_n32_l64_sparse_wavefront_tau0.1_tmax3L
+seeds:
+- 0
+- 1
+- 2
+dataset: fashion_mnist
+model:
+  width: 32
+  depth: 64
+  activation: relu
+method:
+  name: pcalm_layerwise_sparse
+  budget: 2L
+  alpha: 1.0
+  rho: 1.0
+  state_lr: auto
+  inner_steps: 1
+  weight_credit_timing: pre_dual_energy
+  tau: 0.1
+  patience: 3
+  t_min: 2
+  t_max: 3L
+  arrival_frac: 0.1
+  criterion: sum
+  eps_arrive: 0.001
+  mode: freeze
+  gate: wavefront
+training:
+  epochs: 1
+  batch_size: 64
+  eta0: 0.001
+  gamma0: 1.0
+  train_subset: 60000
+  test_subset: 10000
