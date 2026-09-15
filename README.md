@@ -20,9 +20,11 @@ does that save compute or improve accuracy?
   active layer-cycles. Fire times are linear in layer index with slope 1.75 cycles/layer against
   the paper's wave prediction of 2.03. Report: `reports/adaptive-budget-phase2/`.
 
-Compute in phase 2 is counted as active layer-cycles; a dense JAX implementation masks frozen
-layers. The `sparse-implementation` branch realises the saving in wall-clock with real
-conditionals and adds a wavefront gate that also skips layers before the credit wave arrives.
+- **Round 5, sparse implementation** (`pcalm_layerwise_sparse`, branch `sparse-implementation`):
+  real layer skipping with `lax.cond` plus an exact *wavefront* gate that also skips layers before
+  the credit wave reaches them. Executes 21% (L = 64) and 13% (L = 128) of the layer-cycles at
+  matched accuracy; wall-clock on CPU is 0.61x the dense fixed schedule at width 512, break-even
+  at 128, slower at 32 (dispatch-bound). Report: `reports/adaptive-budget-phase2/sparse-implementation-and-l128-report.md`.
 
 ## Layout
 
