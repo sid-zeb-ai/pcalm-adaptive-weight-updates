@@ -43,7 +43,7 @@ def test_tau_zero_reproduces_fixed_budget_pcalm():
         assert jnp.allclose(a, b, atol=1e-5, rtol=1e-5)
 
     g_ref = method_grad(params, scales, skips, x, y, Schedule(family="pcalm", budget=T, alpha=1.0), state_lr=0.1, rho=1.0, phi=phi)
-    g_ad, steps_ad = method_grad_and_steps(
+    g_ad, steps_ad, _ = method_grad_and_steps(
         params, scales, skips, x, y,
         Schedule(family="pcalm_adaptive", budget=T, alpha=1.0, tau=0.0, patience=1, t_min=1, t_max=T, arrival_frac=0.0),
         state_lr=0.1, rho=1.0, phi=phi,

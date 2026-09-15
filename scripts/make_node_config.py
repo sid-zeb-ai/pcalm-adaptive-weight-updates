@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--activation", default="relu")
     p.add_argument("--width", type=int, required=True)
     p.add_argument("--depth", type=int, required=True)
-    p.add_argument("--method", choices=["bp", "pc", "pcalm", "pcalm_adaptive"], required=True)
+    p.add_argument("--method", choices=["bp", "pc", "pcalm", "pcalm_adaptive", "pcalm_layerwise"], required=True)
     p.add_argument("--budget", default="2L", help="int or '<k>L'; ignored by bp")
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--rho", type=float, default=1.0)
@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t-max", default="0", help="int or '<k>L'; 0 -> budget")
     p.add_argument("--arrival-frac", type=float, default=0.1)
     p.add_argument("--criterion", choices=["sum", "max"], default="sum")
+    p.add_argument("--mode", choices=["freeze", "fire_only", "freeze_h"], default="freeze")
+    p.add_argument("--eps-arrive", type=float, default=1e-3)
     p.add_argument("--seeds", default="0,1,2")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--tag")
@@ -49,6 +51,8 @@ def main() -> None:
         tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_bp{ep}"
     elif a.method == "pcalm_adaptive":
         tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_adaptive_{a.criterion}_tau{a.tau:g}_tmax{a.t_max}{ep}"
+    elif a.method == "pcalm_layerwise":
+        tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_layerwise_{a.mode}_tau{a.tau:g}_tmax{a.t_max}{ep}"
     else:
         tag = f"{ds}_{a.activation}_n{a.width}_l{a.depth}_{a.method}_{a.budget}{ep}"
 
@@ -74,6 +78,8 @@ def main() -> None:
             "t_max": int_or_mult(a.t_max),
             "arrival_frac": a.arrival_frac,
             "criterion": a.criterion,
+            "eps_arrive": a.eps_arrive,
+            "mode": a.mode,
         },
         "training": {
             "epochs": a.epochs,

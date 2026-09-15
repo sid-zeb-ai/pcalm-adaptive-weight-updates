@@ -12,13 +12,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a residual MLP with BP, PC, or PC-ALM.")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--dataset", choices=["synthetic", "mnist", "fashion_mnist"])
-    parser.add_argument("--method", choices=["bp", "pc", "pcalm", "pcalm_adaptive"])
+    parser.add_argument("--method", choices=["bp", "pc", "pcalm", "pcalm_adaptive", "pcalm_layerwise"])
     parser.add_argument("--tau", type=float)
     parser.add_argument("--patience", type=int)
     parser.add_argument("--t-min", type=int)
     parser.add_argument("--t-max", type=int)
     parser.add_argument("--arrival-frac", type=float)
     parser.add_argument("--criterion", choices=["sum", "max"])
+    parser.add_argument("--mode", choices=["freeze", "fire_only", "freeze_h"])
+    parser.add_argument("--eps-arrive", type=float)
     parser.add_argument("--width", type=int)
     parser.add_argument("--depth", type=int)
     parser.add_argument("--activation", choices=["linear", "tanh", "relu"])
@@ -63,6 +65,8 @@ def main() -> None:
         "t_max": args.t_max,
         "arrival_frac": args.arrival_frac,
         "criterion": args.criterion,
+        "mode": args.mode,
+        "eps_arrive": args.eps_arrive,
     }
     training_updates = {
         "seed": args.seed,

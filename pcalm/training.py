@@ -59,6 +59,8 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         t_max=method.t_max,
         arrival_frac=method.arrival_frac,
         criterion=method.criterion,
+        eps_arrive=method.eps_arrive,
+        mode=method.mode,
     )
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -74,8 +76,11 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
     if trace_fn is not None:
         write_trace(trace_fn(params, x_diag, y_diag), output_dir / "diag_trace_init.csv")
 
+    n_hidden_layers = model.depth - 1
     rows = []
     steps_per_batch: list[int] = []
+    active_layer_cycles_per_batch: list[int] = []
+    fire_times_per_batch: list[np.ndarray] = []
     epoch_start = 0
     step = 0
     log_every = 100
@@ -83,8 +88,10 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         for batch_idx in batch_order(x_train.shape[0], training.batch_size, training.seed + epoch, training.drop_last):
             xb = jnp.asarray(x_train[batch_idx])
             yb = jnp.asarray(y_train[batch_idx])
-            params, opt_state, inf_steps = update(params, opt_state, xb, yb)
+            params, opt_state, inf_steps, info = update(params, opt_state, xb, yb)
             steps_per_batch.append(int(inf_steps))
+            active_layer_cycles_per_batch.append(int(info["active_layer_cycles"]))
+            fire_times_per_batch.append(np.asarray(info["fire_times"]))
             step += 1
             if step % log_every == 0:
                 recent = steps_per_batch[-log_every:]
@@ -119,7 +126,26 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
     if trace_fn is not None:
         write_trace(trace_fn(params, x_diag, y_diag), output_dir / "diag_trace_final.csv")
     steps_arr = np.asarray(steps_per_batch, dtype=np.float64)
-    cap = (method.t_max if method.t_max > 0 else method.budget) if method.name == "pcalm_adaptive" else method.budget
+    is_layerwise = method.name == "pcalm_layerwise"
+    cap = (
+        (method.t_max if method.t_max > 0 else method.budget)
+        if method.name in ("pcalm_adaptive", "pcalm_layerwise")
+        else method.budget
+    )
+    n_batches = len(steps_per_batch)
+    active_layer_cycles_frac = (
+        float(np.sum(active_layer_cycles_per_batch) / (n_batches * n_hidden_layers * 2 * model.depth))
+        if (is_layerwise and n_batches and n_hidden_layers > 0)
+        else 0.0
+    )
+    if is_layerwise and fire_times_per_batch:
+        fire_times_arr = np.stack(fire_times_per_batch, axis=0).astype(np.float64)  # (n_batches, L-1)
+        mean_fire_time_per_layer = fire_times_arr.mean(axis=0)
+        mean_fire_time_over_L = float(mean_fire_time_per_layer.mean() / model.depth)
+    else:
+        fire_times_arr = None
+        mean_fire_time_per_layer = None
+        mean_fire_time_over_L = 0.0
     final = {
         "dataset": config.dataset,
         "method": method.name,
@@ -144,31 +170,54 @@ def train_one(config: ExperimentConfig, *, data_dir: str | Path = "data") -> dic
         "final_train_mse": rows[-1]["train_mse"],
         "final_test_mse": rows[-1]["test_mse"],
         "grad_cos_to_bp": float(diag["grad_cos_to_bp"]),
-        "tau": method.tau if method.name == "pcalm_adaptive" else 0.0,
+        "tau": method.tau if method.name in ("pcalm_adaptive", "pcalm_layerwise") else 0.0,
         "patience": method.patience,
         "t_min": method.t_min,
         "t_max": cap if method.name != "bp" else 0,
         "arrival_frac": method.arrival_frac,
         "criterion": method.criterion if method.name == "pcalm_adaptive" else "",
+        "mode": method.mode if is_layerwise else "",
         "mean_inf_steps": float(steps_arr.mean()) if steps_arr.size else 0.0,
         "median_inf_steps": float(np.median(steps_arr)) if steps_arr.size else 0.0,
         "min_inf_steps": int(steps_arr.min()) if steps_arr.size else 0,
         "max_inf_steps": int(steps_arr.max()) if steps_arr.size else 0,
         "frac_at_cap": float(np.mean(steps_arr >= cap)) if (steps_arr.size and method.name != "bp") else 0.0,
+        "active_layer_cycles_frac": active_layer_cycles_frac,
+        "mean_fire_time_over_L": mean_fire_time_over_L,
     }
     write_csv(rows, output_dir / "metrics.csv")
     write_json(final, output_dir / "summary.json")
     write_json(asdict(config), output_dir / "config.json")
     if steps_per_batch:
         np.savetxt(output_dir / "inf_steps_per_batch.csv", steps_arr, fmt="%d", header="inf_steps", comments="")
+    if is_layerwise and mean_fire_time_per_layer is not None:
+        with (output_dir / "fire_times_mean.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer", "mean_fire_time"])
+            for layer_ix, mean_t in enumerate(mean_fire_time_per_layer, start=1):
+                writer.writerow([layer_ix, float(mean_t)])
+        n_layers = len(mean_fire_time_per_layer)
+        L = model.depth
+        report_layers = sorted(
+            {
+                1,
+                min(max(1, L // 4), n_layers),
+                min(max(1, L // 2), n_layers),
+                min(max(1, (3 * L) // 4), n_layers),
+                n_layers,
+            }
+        )
+        for layer_ix in report_layers:
+            print(f"FIRETIMES layer={layer_ix} t={float(mean_fire_time_per_layer[layer_ix - 1]):.4f}", flush=True)
     print(
         "RESULT "
         + " ".join(
             f"{k}={final[k]}"
             for k in (
-                "method", "dataset", "activation", "width", "depth", "seed", "tau", "criterion", "t_max",
+                "method", "dataset", "activation", "width", "depth", "seed", "tau", "criterion", "t_max", "mode",
                 "final_test_acc", "final_train_acc", "grad_cos_to_bp",
                 "mean_inf_steps", "median_inf_steps", "min_inf_steps", "max_inf_steps", "frac_at_cap",
+                "active_layer_cycles_frac", "mean_fire_time_over_L",
             )
         ),
         flush=True,
@@ -187,9 +236,9 @@ def adam_learning_rate(width: int, depth: int, eta0: float, gamma0: float, expli
 def make_update_fn(schedule: Schedule, scales, skips, phi, state_lr: float, rho: float, learning_rate: float):
     @jax.jit
     def update(params, opt_state, x, y):
-        grads, steps = method_grad_and_steps(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
+        grads, steps, info = method_grad_and_steps(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
         params, opt_state = adam_apply(params, grads, opt_state, learning_rate)
-        return params, opt_state, steps
+        return params, opt_state, steps, info
 
     return update
 

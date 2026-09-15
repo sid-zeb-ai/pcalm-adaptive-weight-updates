@@ -90,7 +90,10 @@ def main() -> None:
         )
         summaries.append(train_one(cfg, data_dir=args.data_dir))
 
-    keys = ["final_test_acc", "final_train_acc", "grad_cos_to_bp", "mean_inf_steps", "median_inf_steps", "frac_at_cap"]
+    keys = [
+        "final_test_acc", "final_train_acc", "grad_cos_to_bp", "mean_inf_steps", "median_inf_steps", "frac_at_cap",
+        "active_layer_cycles_frac", "mean_fire_time_over_L",
+    ]
     agg = {"tag": tag, "n_seeds": len(summaries), "method": base.method.name, "width": width, "depth": depth,
            "activation": activation, "dataset": dataset, "tau": base.method.tau, "t_max": base.method.t_max,
            "budget": base.method.budget, "state_lr": base.method.state_lr}

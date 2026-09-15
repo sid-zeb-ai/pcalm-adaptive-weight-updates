@@ -36,6 +36,12 @@ class MethodConfig:
     t_max: int = 0
     arrival_frac: float = 0.1
     criterion: str = "sum"  # "sum": layer-summed relative change; "max": max-normalised
+    # Per-layer freeze-and-fire (name == "pcalm_layerwise"). Reuses tau/patience/t_min/t_max
+    # above. `eps_arrive` is the credit-norm floor before a layer is eligible to fire; `mode`
+    # is one of "freeze" (skip primal+dual once fired), "fire_only" (never skip, ablation), or
+    # "freeze_h" (skip primal only, keep integrating the dual).
+    eps_arrive: float = 1e-3
+    mode: str = "freeze"
 
 
 @dataclass(frozen=True)

@@ -22,10 +22,14 @@ class Schedule:
     t_max: int = 0
     arrival_frac: float = 0.1
     criterion: str = "sum"
+    # Per-layer freeze-and-fire fields (family == "pcalm_layerwise"); ignored otherwise.
+    eps_arrive: float = 1e-3
+    mode: str = "freeze"
 
 
 ADAPTIVE_EPS = 1e-12
 ADAPTIVE_CRITERIA = ("sum", "max")
+LAYERWISE_MODES = ("freeze", "fire_only", "freeze_h")
 
 
 def supervised_loss(params: Params, scales, skips, x, y, free, phi) -> jax.Array:
@@ -263,11 +267,163 @@ def trace_pcalm_adaptive(
     return trace
 
 
+def run_pcalm_layerwise(
+    params: Params,
+    scales,
+    skips,
+    x,
+    y,
+    *,
+    state_lr: float,
+    rho: float,
+    alpha: float,
+    tau: float,
+    patience: int,
+    t_min: int,
+    t_max: int,
+    eps_arrive: float,
+    mode: str,
+    inner_steps: int,
+    phi,
+):
+    """Per-layer freeze-and-fire PC-ALM (phase-2 design).
+
+    Each of the L-1 hidden layers watches its own credit `g_i = lambda_i + rho r_i` and fires
+    independently once that credit has arrived and stabilised (relative change < tau for
+    `patience` consecutive cycles, and t >= t_min). A fired layer's credit is frozen at `G_i`
+    for the weight update. In mode "freeze" and "freeze_h" a fired layer's primal step is
+    skipped; "freeze_h" still applies the dual step to fired layers, "freeze" does not;
+    "fire_only" never skips the primal or dual step (an ablation that saves no compute but still
+    freezes the credit used for the weight gradient).
+
+    Returns `(free, duals_eff, steps, info)` where `duals_eff_i = G_i - rho * r_i(final)` so that
+    `al_energy_shifted(..., free, duals_eff, rho, ...)` has weight-gradient contribution
+    `-(rho * r_i + duals_eff_i) = -G_i` in place of `lambda_i + rho r_i`, and `info` carries
+    `fire_times` (int32, shape (L-1,)) and `active_layer_cycles` (int32 scalar).
+    """
+    if mode not in LAYERWISE_MODES:
+        raise ValueError(f"mode must be one of {LAYERWISE_MODES}, got {mode!r}")
+    if t_max < 1:
+        raise ValueError("PC-ALM layerwise t_max must be at least 1")
+    if t_min < 1:
+        raise ValueError("PC-ALM layerwise t_min must be at least 1")
+    if patience < 1:
+        raise ValueError("PC-ALM layerwise patience must be at least 1")
+
+    free0 = free_init(params, scales, skips, x, phi)
+    duals0 = zero_duals_like(constraint_residuals(params, scales, skips, x, free0, phi))
+    n_layers = len(free0)
+    fired0 = [jnp.asarray(False) for _ in range(n_layers)]
+    streak0 = [jnp.asarray(0, dtype=jnp.int32) for _ in range(n_layers)]
+    g_prev0 = zero_duals_like(duals0)
+    G0 = zero_duals_like(duals0)
+    fire_time0 = [jnp.asarray(t_max, dtype=jnp.int32) for _ in range(n_layers)]
+    t0 = jnp.asarray(0, dtype=jnp.int32)
+    active0 = jnp.asarray(0, dtype=jnp.int32)
+    done0 = jnp.asarray(False)
+
+    carry0 = (free0, duals0, g_prev0, G0, fired0, streak0, fire_time0, t0, active0, done0)
+
+    def cond(carry):
+        return jnp.logical_not(carry[-1])
+
+    def primal_step(free_, duals_, fired):
+        """One gradient step of the shifted AL energy w.r.t. all free activities, matching
+        `_solve_inner`'s effective learning rate; a fired layer's update is masked to zero in
+        modes that skip the primal step (dense compute, `jnp.where` masking only)."""
+
+        def energy(free_c):
+            return al_energy_shifted(params, scales, skips, x, y, free_c, duals_, rho, phi)
+
+        grads = jax.grad(energy)(free_)
+        effective_lr = state_lr * free_[0].shape[0]
+        skip_primal = mode in ("freeze", "freeze_h")
+        new_free = []
+        for z, g, is_fired in zip(free_, grads, fired):
+            updated = z - effective_lr * g
+            masked = jnp.where(is_fired & skip_primal, z, updated) if skip_primal else updated
+            new_free.append(masked)
+        return new_free
+
+    def body(carry):
+        free_c, duals_c, g_prev, G_c, fired, streak, fire_time, t, active, _ = carry
+        t = t + 1
+
+        free_next = free_c
+        for _ in range(inner_steps):
+            free_next = primal_step(free_next, duals_c, fired)
+
+        residuals = constraint_residuals(params, scales, skips, x, free_next, phi)
+        credit = [lam + rho * r for lam, r in zip(duals_c, residuals)]
+
+        change = [_fro(g - gp) for g, gp in zip(credit, g_prev)]
+        size = [_fro(g) for g in credit]
+        d = [c / (s + ADAPTIVE_EPS) for c, s in zip(change, size)]
+        streak = [jnp.where(dd < tau, s + 1, 0) for dd, s in zip(d, streak)]
+
+        # Layers whose primal step ran this cycle: those not already fired at the start of it.
+        skip_primal = mode in ("freeze", "freeze_h")
+        if skip_primal:
+            active = active + sum(jnp.where(f, 0, 1) for f in fired)
+        else:
+            active = active + n_layers
+
+        fire_now = [
+            (~f) & (t >= t_min) & (s_fro >= eps_arrive) & (s_streak >= patience)
+            for f, s_fro, s_streak in zip(fired, size, streak)
+        ]
+        G_c = [jnp.where(fn, g, G) for fn, g, G in zip(fire_now, credit, G_c)]
+        fire_time = [jnp.where(fn, t, ft) for fn, ft in zip(fire_now, fire_time)]
+        fired = [f | fn for f, fn in zip(fired, fire_now)]
+
+        done = jnp.stack(fired).all() | (t >= t_max)
+        # Layers still unfired at the stopping cycle take their current credit.
+        G_c = [jnp.where(done & ~f, g, G) for f, g, G in zip(fired, credit, G_c)]
+        fire_time = [jnp.where(done & ~f, t, ft) for f, ft in zip(fired, fire_time)]
+
+        # Dual step for layers that are not (fired and mode == "freeze"); skipped entirely on the
+        # done cycle (the final cycle is a primal step only, matching run_pcalm_adaptive).
+        skip_dual_when_fired = mode == "freeze"
+        duals_next = []
+        for lam, r, f in zip(duals_c, residuals, fired):
+            stepped = lam + alpha * r
+            kept = jnp.where(f & skip_dual_when_fired, lam, stepped)
+            duals_next.append(jnp.where(done, lam, kept))
+
+        return (free_next, duals_next, credit, G_c, fired, streak, fire_time, t, active, done)
+
+    free, duals_before, credit_final, G_final, fired_final, _, fire_time_final, steps, active_final, _ = (
+        jax.lax.while_loop(cond, body, carry0)
+    )
+
+    residuals_final = constraint_residuals(params, scales, skips, x, free, phi)
+    duals_eff = [g - rho * r for g, r in zip(G_final, residuals_final)]
+    info = {
+        "fire_times": jnp.stack(fire_time_final).astype(jnp.int32),
+        "active_layer_cycles": active_final.astype(jnp.int32),
+    }
+    return free, duals_eff, steps, info
+
+
+def _no_layerwise_info(n_layers: int, steps) -> dict[str, jax.Array]:
+    return {
+        "fire_times": jnp.zeros((n_layers,), dtype=jnp.int32),
+        "active_layer_cycles": (jnp.asarray(n_layers, dtype=jnp.int32) * steps).astype(jnp.int32),
+    }
+
+
 def infer_for_schedule(params: Params, scales, skips, x, y, schedule: Schedule, *, state_lr: float, rho: float, phi):
-    """Returns (free, duals, steps); `steps` is the number of primal steps actually taken."""
+    """Returns (free, duals, steps, info); `steps` is the number of primal steps actually taken.
+
+    `info` carries `fire_times` (int32, shape (L-1,)) and `active_layer_cycles` (int32 scalar);
+    for families other than `pcalm_layerwise`, `fire_times` is all zeros and
+    `active_layer_cycles = (L - 1) * steps` (every layer is active every cycle).
+    """
+    n_layers = len(params) - 1
     if schedule.family == "pc":
         free, duals = run_pc(params, scales, skips, x, y, state_lr=state_lr, rho=rho, steps=schedule.budget, phi=phi)
-        return free, duals, jnp.asarray(schedule.budget, dtype=jnp.int32)
+        steps = jnp.asarray(schedule.budget, dtype=jnp.int32)
+        return free, duals, steps, _no_layerwise_info(n_layers, steps)
     if schedule.family == "pcalm":
         free, duals = run_pcalm(
             params,
@@ -283,10 +439,11 @@ def infer_for_schedule(params: Params, scales, skips, x, y, schedule: Schedule, 
             weight_credit_timing=schedule.weight_credit_timing,
             phi=phi,
         )
-        return free, duals, jnp.asarray(schedule.budget, dtype=jnp.int32)
+        steps = jnp.asarray(schedule.budget, dtype=jnp.int32)
+        return free, duals, steps, _no_layerwise_info(n_layers, steps)
     if schedule.family == "pcalm_adaptive":
         t_max = schedule.t_max if schedule.t_max > 0 else schedule.budget
-        return run_pcalm_adaptive(
+        free, duals, steps = run_pcalm_adaptive(
             params,
             scales,
             skips,
@@ -304,22 +461,43 @@ def infer_for_schedule(params: Params, scales, skips, x, y, schedule: Schedule, 
             phi=phi,
             criterion=schedule.criterion,
         )
+        return free, duals, steps, _no_layerwise_info(n_layers, steps)
+    if schedule.family == "pcalm_layerwise":
+        return run_pcalm_layerwise(
+            params,
+            scales,
+            skips,
+            x,
+            y,
+            state_lr=state_lr,
+            rho=rho,
+            alpha=schedule.alpha,
+            tau=schedule.tau,
+            patience=schedule.patience,
+            t_min=schedule.t_min,
+            t_max=schedule.t_max if schedule.t_max > 0 else schedule.budget,
+            eps_arrive=schedule.eps_arrive,
+            mode=schedule.mode,
+            inner_steps=schedule.inner_steps,
+            phi=phi,
+        )
     raise ValueError(f"unknown schedule family: {schedule.family}")
 
 
 def method_grad_and_steps(params: Params, scales, skips, x, y, schedule: Schedule, *, state_lr: float, rho: float, phi):
     if schedule.family == "bp":
         grads = jax.grad(lambda p: bp_loss(p, scales, skips, x, y, phi))(params)
-        return grads, jnp.asarray(0, dtype=jnp.int32)
-    free, duals, steps = infer_for_schedule(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
+        steps = jnp.asarray(0, dtype=jnp.int32)
+        return grads, steps, _no_layerwise_info(len(params) - 1, jnp.asarray(0, dtype=jnp.int32))
+    free, duals, steps, info = infer_for_schedule(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
     free = jax.tree_util.tree_map(jax.lax.stop_gradient, free)
     duals = jax.tree_util.tree_map(jax.lax.stop_gradient, duals)
     grads = jax.grad(lambda p: al_energy_shifted(p, scales, skips, x, y, free, duals, rho, phi))(params)
-    return grads, steps
+    return grads, steps, info
 
 
 def method_grad(params: Params, scales, skips, x, y, schedule: Schedule, *, state_lr: float, rho: float, phi):
-    grads, _ = method_grad_and_steps(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
+    grads, _, _ = method_grad_and_steps(params, scales, skips, x, y, schedule, state_lr=state_lr, rho=rho, phi=phi)
     return grads
 
 
